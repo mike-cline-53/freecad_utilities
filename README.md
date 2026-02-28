@@ -14,15 +14,9 @@ Automatically snaps nearby unrestrained vertices in a FreeCAD sketch by adding c
 3. Run `auto_snap_vertices.FCMacro`
 4. Configure options in the dialog and apply
 
-### [smart_select](smart_select/)
+## Recommended Companion Macros
 
-Select similar faces and edges in a FreeCAD document based on configurable criteria such as area, length, and position. Originally by [WayofWood](https://github.com/WayofWood).
-
-**Usage:**
-1. Select a face or edge in FreeCAD
-2. Run `smart_select.FCMacro`
-3. Choose your matching criteria (same object, same area, same X/Y/Z, precision)
-4. Matching geometry will be added to the selection
+- **[SmartSelect](https://github.com/wayofwood/FreeCADScripts/tree/main/smartselect)** by WayofWood — Select similar faces and edges based on area, length, and position. Great for CNC workflows.
 
 ## Installation
 
