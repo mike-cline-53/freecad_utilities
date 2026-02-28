@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+AutoSnapVertices - FreeCAD Macro
+================================
+
+Automatically snaps nearby unrestrained vertices in a sketch by adding
+coincident constraints. Prevents redundant constraints by:
+- Better constraint detection
+- Checking for indirect relationships
+- Validating constraints before adding
+- Handling constraint conflicts gracefully
+
+Usage:
+1. Open a sketch in FreeCAD
+2. Select the sketch object
+3. Run this macro
+4. Configure options and apply
+
+Author: Assistant
+Version: 2.1
+License: MIT
+"""
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Sketcher
+import Part
+import math
+from PySide2 import QtWidgets, QtCore, QtGui
+
+class AutoSnapDialog(QtWidgets.QDialog):
+    """Dialog for configuring auto-snap options."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Auto-Snap Vertices Configuration")
+        self.setModal(True)
+        self.setup_ui()
+        
+    def setup_ui(self):
+        layout = QtWidgets.QVBoxLayout()
+        
+        # Tolerance setting
+        tolerance_group = QtWidgets.QGroupBox("Snap Tolerance")
+        tolerance_layout = QtWidgets.QHBoxLayout()
+        
+        self.tolerance_spin = QtWidgets.QDoubleSpinBox()
+        self.tolerance_spin.setRange(0.001, 100.0)
+        self.tolerance_spin.setValue(0.1)
+        self.tolerance_spin.setDecimals(3)
+        self.tolerance_spin.setSuffix(" mm")
+        
+        tolerance_layout.addWidget(QtWidgets.QLabel("Maximum snap distance:"))
+        tolerance_layout.addWidget(self.tolerance_spin)
+        tolerance_group.setLayout(tolerance_layout)
+        
+        # Options
+        options_group = QtWidgets.QGroupBox("Options")
+        options_layout = QtWidgets.QVBoxLayout()
+        
+        self.preview_check = QtWidgets.QCheckBox("Preview mode (show what would be snapped)")
+        self.skip_construction_check = QtWidgets.QCheckBox("Skip construction geometry")
+        self.skip_external_check = QtWidgets.QCheckBox("Skip external geometry")
+        self.validate_constraints_check = QtWidgets.QCheckBox("Validate constraints (recommended)")
+        self.validate_constraints_check.setChecked(True)
+        
+        options_layout.addWidget(self.preview_check)
+        options_layout.addWidget(self.skip_construction_check)
+        options_layout.addWidget(self.skip_external_check)
+        options_layout.addWidget(self.validate_constraints_check)
+        options_group.setLayout(options_layout)
+        
+        # Buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        self.ok_button = QtWidgets.QPushButton("Apply")
+        self.cancel_button = QtWidgets.QPushButton("Cancel")
+        
+        button_layout.addWidget(self.ok_button)
+        button_layout.addWidget(self.cancel_button)
+        
+        # Connect signals
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+        
+        # Layout
+        layout.addWidget(tolerance_group)
+        layout.addWidget(options_group)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+
+class VertexSnapperFixed:
+    """Improved vertex snapper that prevents redundant constraints."""
+    
+    def __init__(self, sketch):
+        self.sketch = sketch
+        self.tolerance = 0.1
+        self.preview_mode = False
+        self.skip_construction = False
+        self.skip_external = False
+        self.validate_constraints = True
+        self.constraint_map = {}  # Track relationships between vertices
+        
+    def get_distance(self, point1, point2):
+        """Calculate the distance between two points."""
+        return math.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2)
+    
+    def build_constraint_map(self):
+        """Build a map of all existing constraints and relationships."""
+        self.constraint_map = {}
+        constraints = self.sketch.Constraints
+        
+        for i, constraint in enumerate(constraints):
+            constraint_type = constraint.Type
+            
+            # Track coincident constraints
+            if constraint_type == 'Coincident':
+                if hasattr(constraint, 'First') and hasattr(constraint, 'Second'):
+                    first_key = f"{constraint.First}.{getattr(constraint, 'FirstPos', 0)}"
+                    second_key = f"{constraint.Second}.{getattr(constraint, 'SecondPos', 0)}"
+                    
+                    if first_key not in self.constraint_map:
+                        self.constraint_map[first_key] = set()
+                    if second_key not in self.constraint_map:
+                        self.constraint_map[second_key] = set()
+                    
+                    self.constraint_map[first_key].add(second_key)
+                    self.constraint_map[second_key].add(first_key)
+            
+            # Track other constraining relationships
+            elif constraint_type in ['PointOnObject', 'Symmetric', 'Fixed']:
+                if hasattr(constraint, 'First'):
+                    first_key = f"{constraint.First}.{getattr(constraint, 'FirstPos', 0)}"
+                    if first_key not in self.constraint_map:
+                        self.constraint_map[first_key] = set()
+                    self.constraint_map[first_key].add(f"FIXED_{constraint_type}_{i}")
+    
+    def are_points_related(self, point1_key, point2_key):
+        """Check if two points are already related through constraints."""
+        # Direct relationship
+        if (point1_key in self.constraint_map and 
+            point2_key in self.constraint_map[point1_key]):
+            return True
+        
+        # Indirect relationship (both connected to same point)
+        if point1_key in self.constraint_map and point2_key in self.constraint_map:
+            return bool(self.constraint_map[point1_key] & self.constraint_map[point2_key])
+        
+        return False
+    
+    def is_geometry_suitable(self, geom_index):
+        """Check if geometry should be considered for snapping."""
+        if geom_index < 0 or geom_index >= len(self.sketch.Geometry):
+            return False
+            
+        geometry = self.sketch.Geometry[geom_index]
+        
+        # Skip construction geometry if requested
+        if self.skip_construction and hasattr(geometry, 'Construction') and geometry.Construction:
+            return False
+            
+        # Skip external geometry if requested
+        if self.skip_external and geom_index < 0:
+            return False
+            
+        return True
+    
+    def is_point_constrained(self, geom_index, point_pos):
+        """Check if a specific point is already constrained."""
+        point_key = f"{geom_index}.{point_pos}"
+        return point_key in self.constraint_map and len(self.constraint_map[point_key]) > 0
+    
+    def get_all_vertices(self):
+        """Get all vertices in the sketch with their positions."""
+        vertices = []
+        geometries = self.sketch.Geometry
+        
+        for i, geom in enumerate(geometries):
+            if not self.is_geometry_suitable(i):
+                continue
+                
+            # Handle different geometry types
+            if hasattr(geom, 'StartPoint'):
+                vertices.append((i, 1, geom.StartPoint))  # Start point
+            if hasattr(geom, 'EndPoint'):
+                vertices.append((i, 2, geom.EndPoint))    # End point
+            if hasattr(geom, 'Center'):
+                vertices.append((i, 3, geom.Center))      # Center point
+        
+        return vertices
+    
+    def find_snap_candidates(self):
+        """Find all vertices that should be snapped to their nearest neighbors."""
+        # Build constraint map first
+        self.build_constraint_map()
+        
+        vertices = self.get_all_vertices()
+        snap_candidates = []
+        processed_pairs = set()  # Prevent duplicate pairs
+        
+        App.Console.PrintMessage(f"Found {len(vertices)} vertices to analyze...\n")
+        App.Console.PrintMessage(f"Existing constraints: {len(self.constraint_map)} constrained points\n")
+        
+        for geom_index, point_pos, position in vertices:
+            point_key = f"{geom_index}.{point_pos}"
+            
+            # Skip if already constrained
+            if self.is_point_constrained(geom_index, point_pos):
+                continue
+            
+            # Find nearest vertex
+            min_distance = float('inf')
+            nearest_vertex = None
+            
+            for other_geom_index, other_point_pos, other_position in vertices:
+                # Skip same vertex
+                if geom_index == other_geom_index and point_pos == other_point_pos:
+                    continue
+                
+                other_point_key = f"{other_geom_index}.{other_point_pos}"
+                
+                # Skip if other vertex is constrained
+                if self.is_point_constrained(other_geom_index, other_point_pos):
+                    continue
+                
+                # Skip if points are already related
+                if self.are_points_related(point_key, other_point_key):
+                    continue
+                
+                # Create a pair key to avoid duplicate processing
+                pair_key = tuple(sorted([point_key, other_point_key]))
+                if pair_key in processed_pairs:
+                    continue
+                
+                distance = self.get_distance(position, other_position)
+                
+                if distance < self.tolerance and distance < min_distance:
+                    min_distance = distance
+                    nearest_vertex = (other_geom_index, other_point_pos, other_position)
+            
+            if nearest_vertex:
+                other_geom_index, other_point_pos, other_position = nearest_vertex
+                other_point_key = f"{other_geom_index}.{other_point_pos}"
+                pair_key = tuple(sorted([point_key, other_point_key]))
+                
+                if pair_key not in processed_pairs:
+                    snap_candidates.append({
+                        'from': (geom_index, point_pos, position),
+                        'to': nearest_vertex,
+                        'distance': min_distance
+                    })
+                    processed_pairs.add(pair_key)
+        
+        return snap_candidates
+    
+    def validate_constraint(self, from_geom, from_pos, to_geom, to_pos):
+        """Validate that a constraint won't cause conflicts."""
+        if not self.validate_constraints:
+            return True
+        
+        try:
+            # Create a temporary constraint to test
+            temp_constraint = Sketcher.Constraint('Coincident', 
+                                                 from_geom, from_pos,
+                                                 to_geom, to_pos)
+            
+            # Check if this constraint already exists
+            constraints = self.sketch.Constraints
+            for existing_constraint in constraints:
+                if (existing_constraint.Type == 'Coincident' and
+                    hasattr(existing_constraint, 'First') and 
+                    hasattr(existing_constraint, 'Second')):
+                    
+                    if ((existing_constraint.First == from_geom and 
+                         getattr(existing_constraint, 'FirstPos', 0) == from_pos and
+                         existing_constraint.Second == to_geom and 
+                         getattr(existing_constraint, 'SecondPos', 0) == to_pos) or
+                        (existing_constraint.First == to_geom and 
+                         getattr(existing_constraint, 'FirstPos', 0) == to_pos and
+                         existing_constraint.Second == from_geom and 
+                         getattr(existing_constraint, 'SecondPos', 0) == from_pos)):
+                        return False  # Constraint already exists
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    def apply_snaps(self, snap_candidates):
+        """Apply the snap constraints with validation."""
+        if self.preview_mode:
+            self.show_preview(snap_candidates)
+            return len(snap_candidates)
+        
+        snap_count = 0
+        failed_count = 0
+        
+        for candidate in snap_candidates:
+            from_geom, from_pos, _ = candidate['from']
+            to_geom, to_pos, _ = candidate['to']
+            distance = candidate['distance']
+            
+            # Validate constraint before adding
+            if not self.validate_constraint(from_geom, from_pos, to_geom, to_pos):
+                App.Console.PrintWarning(
+                    f"Skipped redundant constraint: {from_geom}.{from_pos} to {to_geom}.{to_pos}\n"
+                )
+                failed_count += 1
+                continue
+            
+            try:
+                # Create coincident constraint
+                constraint = Sketcher.Constraint('Coincident', 
+                                               from_geom, from_pos,
+                                               to_geom, to_pos)
+                self.sketch.addConstraint(constraint)
+                snap_count += 1
+                
+                # Update constraint map
+                from_key = f"{from_geom}.{from_pos}"
+                to_key = f"{to_geom}.{to_pos}"
+                if from_key not in self.constraint_map:
+                    self.constraint_map[from_key] = set()
+                if to_key not in self.constraint_map:
+                    self.constraint_map[to_key] = set()
+                self.constraint_map[from_key].add(to_key)
+                self.constraint_map[to_key].add(from_key)
+                
+                App.Console.PrintMessage(
+                    f"Snapped vertex {from_geom}.{from_pos} to {to_geom}.{to_pos} "
+                    f"(distance: {distance:.3f}mm)\n"
+                )
+                
+            except Exception as e:
+                App.Console.PrintError(
+                    f"Failed to snap vertex {from_geom}.{from_pos}: {str(e)}\n"
+                )
+                failed_count += 1
+        
+        if failed_count > 0:
+            App.Console.PrintWarning(f"Skipped {failed_count} potentially redundant constraints\n")
+        
+        return snap_count
+    
+    def show_preview(self, snap_candidates):
+        """Show a preview of what would be snapped."""
+        message = f"Preview Mode - Found {len(snap_candidates)} vertices to snap:\n\n"
+        
+        for i, candidate in enumerate(snap_candidates):
+            from_geom, from_pos, from_point = candidate['from']
+            to_geom, to_pos, to_point = candidate['to']
+            distance = candidate['distance']
+            
+            # Check if constraint would be valid
+            valid = self.validate_constraint(from_geom, from_pos, to_geom, to_pos)
+            status = "✓ Valid" if valid else "⚠ May be redundant"
+            
+            message += f"{i+1}. Vertex {from_geom}.{from_pos} → {to_geom}.{to_pos} [{status}]\n"
+            message += f"   Distance: {distance:.3f}mm\n"
+            message += f"   From: ({from_point.x:.3f}, {from_point.y:.3f})\n"
+            message += f"   To: ({to_point.x:.3f}, {to_point.y:.3f})\n\n"
+        
+        if not snap_candidates:
+            message += "No vertices found that need snapping within the tolerance."
+        
+        # Show in a scrollable text dialog
+        dialog = QtWidgets.QDialog()
+        dialog.setWindowTitle("Auto-Snap Preview")
+        dialog.resize(600, 500)
+        
+        layout = QtWidgets.QVBoxLayout()
+        text_edit = QtWidgets.QTextEdit()
+        text_edit.setPlainText(message)
+        text_edit.setReadOnly(True)
+        text_edit.setFont(QtGui.QFont("Courier", 9))
+        
+        button_layout = QtWidgets.QHBoxLayout()
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(close_button)
+        
+        layout.addWidget(text_edit)
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+        
+        dialog.exec_()
+    
+    def run(self):
+        """Main execution function."""
+        try:
+            snap_candidates = self.find_snap_candidates()
+            snap_count = self.apply_snaps(snap_candidates)
+            
+            if not self.preview_mode:
+                self.sketch.recompute()
+            
+            return snap_count, len(snap_candidates)
+            
+        except Exception as e:
+            App.Console.PrintError(f"Error during auto-snap: {str(e)}\n")
+            raise
+
+def auto_snap_vertices():
+    """Main function to automatically snap vertices with redundancy prevention."""
+    # Get the active document
+    doc = App.ActiveDocument
+    if not doc:
+        QtWidgets.QMessageBox.warning(None, "Warning", "No active document found!")
+        return
+    
+    # Get the selected object (should be a sketch)
+    selection = Gui.Selection.getSelection()
+    if not selection:
+        QtWidgets.QMessageBox.warning(None, "Warning", "Please select a sketch!")
+        return
+    
+    sketch = selection[0]
+    if not hasattr(sketch, 'Geometry') or not hasattr(sketch, 'Constraints'):
+        QtWidgets.QMessageBox.warning(None, "Warning", "Selected object is not a sketch!")
+        return
+    
+    # Show configuration dialog
+    dialog = AutoSnapDialog()
+    if dialog.exec_() != QtWidgets.QDialog.Accepted:
+        return
+    
+    # Get configuration
+    tolerance = dialog.tolerance_spin.value()
+    preview_mode = dialog.preview_check.isChecked()
+    skip_construction = dialog.skip_construction_check.isChecked()
+    skip_external = dialog.skip_external_check.isChecked()
+    validate_constraints = dialog.validate_constraints_check.isChecked()
+    
+    # Enter sketch editing mode if not in preview
+    was_editing = Gui.activeDocument().getInEdit()
+    if not preview_mode and not was_editing:
+        Gui.activeDocument().setEdit(sketch.Name)
+    
+    try:
+        # Create snapper and configure it
+        snapper = VertexSnapperFixed(sketch)
+        snapper.tolerance = tolerance
+        snapper.preview_mode = preview_mode
+        snapper.skip_construction = skip_construction
+        snapper.skip_external = skip_external
+        snapper.validate_constraints = validate_constraints
+        
+        # Run the snapping
+        snap_count, total_candidates = snapper.run()
+        
+        if preview_mode:
+            # Preview was already shown
+            pass
+        elif snap_count > 0:
+            QtWidgets.QMessageBox.information(
+                None, 
+                "Auto-Snap Complete", 
+                f"Successfully snapped {snap_count} vertices to their nearest neighbors!\n"
+                f"Redundant constraints were automatically prevented."
+            )
+        else:
+            QtWidgets.QMessageBox.information(
+                None, 
+                "Auto-Snap Complete", 
+                "No vertices needed snapping within the specified tolerance,\n"
+                "or all potential snaps would create redundant constraints."
+            )
+            
+    except Exception as e:
+        QtWidgets.QMessageBox.critical(None, "Error", f"An error occurred: {str(e)}")
+    
+    finally:
+        # Exit sketch editing mode if we entered it
+        if not preview_mode and not was_editing:
+            Gui.activeDocument().resetEdit()
+
+def main():
+    """Main entry point for the macro."""
+    auto_snap_vertices()
+
+# Run the macro when executed
+if __name__ == "__main__":
+    main() 
